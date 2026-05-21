@@ -554,6 +554,9 @@ class ColorByNumbersApp:
         scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
+        # Clear old previews from previous image to prevent caching issues
+        self.processed_previews = {}
+        
         # Store references
         self.method_cards = {}
         self.method_thumbnails = {}
@@ -768,6 +771,36 @@ class ColorByNumbersApp:
                 print("User cancelled save dialog")
                 return
             
+            # Ask about grid style (traditional or merged regions)
+            style_choice = messagebox.askyesnocancel(
+                "Grid Style",
+                "How should the grid be labeled?\n\n"
+                "YES: Merged Regions (erase shared borders, label sections)\n"
+                "NO: Traditional (each pixel labeled separately)\n"
+                "CANCEL: Don't save"
+            )
+            
+            if style_choice is None:
+                print("User cancelled save dialog")
+                return
+            
+            # If merged regions, ask about label type
+            use_borders = False
+            if style_choice:  # Merged regions mode
+                label_choice = messagebox.askyesnocancel(
+                    "Label Style",
+                    "How should regions be marked?\n\n"
+                    "YES: Colored Borders (thin colored lines showing region color)\n"
+                    "NO: Text Labels (number/letter labels in each region)\n"
+                    "CANCEL: Don't save"
+                )
+                
+                if label_choice is None:
+                    print("User cancelled save dialog")
+                    return
+                
+                use_borders = label_choice  # True = borders, False = text labels
+            
             # Open save dialog
             file_path = filedialog.asksaveasfilename(
                 defaultextension=".pdf",
@@ -781,6 +814,8 @@ class ColorByNumbersApp:
             print(f"Attempting to save PDF to: {file_path}")
             print(f"Selected preview: {self.selected_preview}")
             print(f"Available previews: {list(self.processed_previews.keys())}")
+            print(f"Grid style: {'Merged Regions' if style_choice else 'Traditional'}")
+            print(f"Label style: {'Colored Borders' if use_borders else 'Text Labels'}")
             
             # Generate PDF
             if self.selected_preview and self.selected_preview in self.processed_previews:
@@ -788,12 +823,12 @@ class ColorByNumbersApp:
                 print(f"Processing image: {processed_image.size}")
                 
                 if format_choice:  # YES - separate files
-                    grid_path, final_path = save_pdf_separate(processed_image, self.palette, file_path)
+                    grid_path, final_path = save_pdf_separate(processed_image, self.palette, file_path, merged_regions=style_choice, use_borders=use_borders)
                     print(f"Grid PDF saved to: {grid_path}")
                     print(f"Final PDF saved to: {final_path}")
                     messagebox.showinfo("Success", f"PDFs saved successfully:\n\n{grid_path}\n{final_path}")
                 else:  # NO - single file
-                    save_pdf(processed_image, self.palette, file_path)
+                    save_pdf(processed_image, self.palette, file_path, merged_regions=style_choice, use_borders=use_borders)
                     print(f"PDF saved to: {file_path}")
                     messagebox.showinfo("Success", f"PDF saved successfully:\n{file_path}")
                 

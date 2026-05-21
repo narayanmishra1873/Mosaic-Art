@@ -86,20 +86,28 @@ class PDFGenerator:
         
         return closest_label
     
-    def generate_pdf(self, output_path: str) -> None:
+    def generate_pdf(self, output_path: str, merged_regions: bool = False, use_borders: bool = False) -> None:
         """
         Generate and save a 2-page PDF file.
-        Page 1: Grid with thin lines and color labels
+        Page 1: Grid with thin lines and color labels (or colored borders)
         Page 2: Final processed image as reference
         
         Args:
             output_path: Path to save the PDF file
+            merged_regions: If True, merge contiguous same-color regions
+            use_borders: If True, draw colored borders instead of text labels (only in merged mode)
         """
         # Create canvas
         pdf_canvas = canvas.Canvas(output_path, pagesize=A4)
         
         # ============ PAGE 1: GRID WITH LABELS ============
-        self._draw_grid_page(pdf_canvas)
+        if merged_regions:
+            if use_borders:
+                self._draw_grid_page_merged_borders(pdf_canvas)
+            else:
+                self._draw_grid_page_merged(pdf_canvas)
+        else:
+            self._draw_grid_page(pdf_canvas)
         
         # ============ PAGE 2: REFERENCE IMAGE ============
         pdf_canvas.showPage()
@@ -145,6 +153,10 @@ class PDFGenerator:
                 
                 label = self.get_pixel_label(pixel_rgb)
                 
+                # Skip white pixels (leave empty for paper color)
+                if pixel_rgb == (255, 255, 255):
+                    continue
+                
                 # Calculate text position (center of cell with proper margins)
                 text_x = x + cell_size / 2
                 # Use smaller font (20% of cell_size) for thinner appearance matching grid lines
@@ -156,6 +168,303 @@ class PDFGenerator:
                 pdf_canvas.setFont("Helvetica", font_size)
                 pdf_canvas.setFillColor(text_color)
                 pdf_canvas.drawCentredString(text_x, text_y, label)
+    
+    def _draw_grid_page_merged(self, pdf_canvas) -> None:
+        """
+        Draw page 1 with merged regions: shared borders erased for same-color pixels.
+        Time Complexity: O(W*H)
+        """
+        # Find regions using efficient flood fill
+        from image_processor import ImageProcessor
+        processor = ImageProcessor(self.palette)
+        region_map, regions = processor.find_regions(self.processed_image)
+        
+        # Calculate grid dimensions
+        cell_size, grid_width, grid_height, start_x, start_y = self.calculate_grid_dimensions()
+        
+        # Get image data
+        image_array = np.array(self.processed_image, dtype=np.uint8)
+        height, width = image_array.shape[:2]
+        
+        # Draw grid with smart borders (only where colors differ)
+        pdf_canvas.setLineWidth(0.1)  # Ultra-thin lines
+        
+        from reportlab.lib.colors import HexColor
+        text_color = HexColor("#808080")  # Medium gray
+        
+        labeled_regions = set()  # Track which regions we've labeled
+        
+        for row in range(height):
+            for col in range(width):
+                x = start_x + col * cell_size
+                y = start_y + (height - row - 1) * cell_size
+                
+                current_region_id = region_map.get((col, row))
+                
+                # Draw borders only at region boundaries
+                # Top border
+                if row == 0 or region_map.get((col, row - 1)) != current_region_id:
+                    pdf_canvas.line(x, y + cell_size, x + cell_size, y + cell_size)
+                
+                # Bottom border
+                if row == height - 1 or region_map.get((col, row + 1)) != current_region_id:
+                    pdf_canvas.line(x, y, x + cell_size, y)
+                
+                # Left border
+                if col == 0 or region_map.get((col - 1, row)) != current_region_id:
+                    pdf_canvas.line(x, y, x, y + cell_size)
+                
+                # Right border
+                if col == width - 1 or region_map.get((col + 1, row)) != current_region_id:
+                    pdf_canvas.line(x + cell_size, y, x + cell_size, y + cell_size)
+        
+        # Label each region - multiple labels for large regions based on size
+        MAX_PIXELS_PER_LABEL = 500  # One label per 500 pixels (adjust for label density)
+        
+        for region_id, region_data in regions.items():
+            if region_id not in labeled_regions:
+                color_rgb = region_data['color']
+                label = self.get_pixel_label(color_rgb)
+                
+                # Skip white regions (leave empty for paper color)
+                if color_rgb == (245, 245, 245):
+                    continue
+                
+                # Find all pixels in this region
+                region_pixels = [pos for pos, rid in region_map.items() if rid == region_id]
+                
+                if not region_pixels:
+                    continue
+                
+                # Calculate how many labels needed for this region
+                num_labels = max(1, len(region_pixels) // MAX_PIXELS_PER_LABEL)
+                
+                # Place labels distributed throughout the region
+                for label_idx in range(num_labels):
+                    # Divide pixels into groups
+                    start_idx = (label_idx * len(region_pixels)) // num_labels
+                    end_idx = ((label_idx + 1) * len(region_pixels)) // num_labels
+                    label_group = region_pixels[start_idx:end_idx]
+                    
+                    # Find centroid of this group
+                    group_cx = sum(p[0] for p in label_group) / len(label_group)
+                    group_cy = sum(p[1] for p in label_group) / len(label_group)
+                    
+                    # Find closest pixel to group centroid
+                    closest_pixel = min(
+                        label_group,
+                        key=lambda p: (p[0] - group_cx) ** 2 + (p[1] - group_cy) ** 2
+                    )
+                    label_x, label_y = closest_pixel
+                    
+                    # Convert pixel coordinates to PDF coordinates
+                    pdf_x = start_x + label_x * cell_size + cell_size / 2
+                    pdf_y = start_y + (height - label_y - 1) * cell_size + cell_size / 2
+                    
+                    # Larger font for regions (20% of cell_size)
+                    font_size = max(6, int(cell_size * 0.25))
+                    
+                    pdf_canvas.setFont("Helvetica-Bold", font_size)
+                    pdf_canvas.setFillColor(text_color)
+                    pdf_canvas.drawCentredString(pdf_x, pdf_y - (font_size * 0.35), label)
+                
+                labeled_regions.add(region_id)
+    
+    def _draw_grid_page_merged_borders(self, pdf_canvas) -> None:
+        """
+        Draw page 1 with merged regions: black grid + colored region-boundary borders.
+        For shared edges between different colors: split line showing both colors (half thickness each).
+        For edges facing white: full color line.
+        White regions remain empty (no colored marking).
+        """
+        # Find regions using efficient flood fill
+        from image_processor import ImageProcessor
+        processor = ImageProcessor(self.palette)
+        region_map, regions = processor.find_regions(self.processed_image)
+        
+        # Calculate grid dimensions
+        cell_size, grid_width, grid_height, start_x, start_y = self.calculate_grid_dimensions()
+        
+        # Get image data
+        image_array = np.array(self.processed_image, dtype=np.uint8)
+        height, width = image_array.shape[:2]
+        
+        from reportlab.lib.colors import HexColor
+        
+        # PASS 1: Draw black grid lines (region boundaries only)
+        pdf_canvas.setLineWidth(0.1)
+        pdf_canvas.setStrokeColor(HexColor("#000000"))
+        
+        for row in range(height):
+            for col in range(width):
+                x = start_x + col * cell_size
+                y = start_y + (height - row - 1) * cell_size
+                
+                current_region_id = region_map.get((col, row))
+                
+                # Draw black grid ONLY at region boundaries
+                # Top border
+                if row == 0 or region_map.get((col, row - 1)) != current_region_id:
+                    pdf_canvas.line(x, y + cell_size, x + cell_size, y + cell_size)
+                
+                # Bottom border
+                if row == height - 1 or region_map.get((col, row + 1)) != current_region_id:
+                    pdf_canvas.line(x, y, x + cell_size, y)
+                
+                # Left border
+                if col == 0 or region_map.get((col - 1, row)) != current_region_id:
+                    pdf_canvas.line(x, y, x, y + cell_size)
+                
+                # Right border
+                if col == width - 1 or region_map.get((col + 1, row)) != current_region_id:
+                    pdf_canvas.line(x + cell_size, y, x + cell_size, y + cell_size)
+        
+        # PASS 1.5: Fill non-white regions with light gray background
+        from reportlab.lib.colors import HexColor
+        pdf_canvas.setFillColor(HexColor("#EBEBEB"))
+        pdf_canvas.setLineWidth(0)  # No outline for fill
+        
+        for row in range(height):
+            for col in range(width):
+                current_region_id = region_map.get((col, row))
+                current_color = regions[current_region_id]['color'] if current_region_id in regions else None
+                
+                # Fill non-white regions with light gray
+                if current_color != (255, 255, 255):
+                    x = start_x + col * cell_size
+                    y = start_y + (height - row - 1) * cell_size
+                    pdf_canvas.rect(x, y, cell_size, cell_size, fill=1, stroke=0)
+        
+        # PASS 2: Draw colored strokes at region boundaries
+        # For shared edges between colors: split the line (both colors visible)
+        # For edges facing white: full colored line
+        pdf_canvas.setLineWidth(0.5)  # Base thickness
+        
+        for region_id, region_data in regions.items():
+            color_rgb = region_data['color']
+            
+            # Skip white regions - leave them blank/empty
+            if color_rgb == (255, 255, 255):
+                continue
+            
+            # Convert RGB to hex for reportlab - use ACTUAL color for borders
+            r, g, b = color_rgb
+            # Use actual region color for borders so they're visible
+            color_hex = f"#{r:02x}{g:02x}{b:02x}"
+            
+            # Find all pixels in this region
+            region_pixels = [pos for pos, rid in region_map.items() if rid == region_id]
+            
+            if not region_pixels:
+                continue
+            
+            # Draw colored strokes at region perimeter
+            for px, py in region_pixels:
+                x = start_x + px * cell_size
+                y = start_y + (height - py - 1) * cell_size
+                
+                # Check all 4 edges
+                # TOP edge
+                if py == 0 or region_map.get((px, py - 1)) != region_id:
+                    adjacent_region_id = region_map.get((px, py - 1)) if py > 0 else None
+                    adjacent_color = regions[adjacent_region_id]['color'] if adjacent_region_id and adjacent_region_id in regions else (255, 255, 255)
+                    
+                    if adjacent_color != (255, 255, 255) and adjacent_color != color_rgb:
+                        # Shared edge: current color draws inside this region, adjacent color draws inside its region
+                        pdf_canvas.setLineWidth(0.25)
+                        # Current color (below adjacent): draw at bottom of this edge
+                        pdf_canvas.setStrokeColor(HexColor(color_hex))
+                        pdf_canvas.line(x, y + cell_size - 0.15, x + cell_size, y + cell_size - 0.15)
+                        
+                        # Adjacent color (above this region): draw at top of this edge
+                        ar, ag, ab = adjacent_color
+                        adj_hex = f"#{ar:02x}{ag:02x}{ab:02x}"
+                        pdf_canvas.setStrokeColor(HexColor(adj_hex))
+                        pdf_canvas.line(x, y + cell_size + 0.15, x + cell_size, y + cell_size + 0.15)
+                    else:
+                        # Edge facing white: color on color's side, white on white's side
+                        pdf_canvas.setLineWidth(0.25)
+                        pdf_canvas.setStrokeColor(HexColor(color_hex))
+                        pdf_canvas.line(x, y + cell_size - 0.15, x + cell_size, y + cell_size - 0.15)
+                        # White side
+                        pdf_canvas.setStrokeColor(HexColor("#FFFFFF"))
+                        pdf_canvas.line(x, y + cell_size + 0.15, x + cell_size, y + cell_size + 0.15)
+                
+                
+                # BOTTOM edge
+                if py == height - 1 or region_map.get((px, py + 1)) != region_id:
+                    adjacent_region_id = region_map.get((px, py + 1)) if py < height - 1 else None
+                    adjacent_color = regions[adjacent_region_id]['color'] if adjacent_region_id and adjacent_region_id in regions else (255, 255, 255)
+                    
+                    if adjacent_color != (255, 255, 255) and adjacent_color != color_rgb:
+                        pdf_canvas.setLineWidth(0.25)
+                        # Current color (above adjacent): draw at top of this edge
+                        pdf_canvas.setStrokeColor(HexColor(color_hex))
+                        pdf_canvas.line(x, y + 0.15, x + cell_size, y + 0.15)
+                        
+                        # Adjacent color (below this region): draw at bottom of this edge
+                        ar, ag, ab = adjacent_color
+                        adj_hex = f"#{ar:02x}{ag:02x}{ab:02x}"
+                        pdf_canvas.setStrokeColor(HexColor(adj_hex))
+                        pdf_canvas.line(x, y - 0.15, x + cell_size, y - 0.15)
+                    else:
+                        # Edge facing white: color on color's side, white on white's side
+                        pdf_canvas.setLineWidth(0.25)
+                        pdf_canvas.setStrokeColor(HexColor(color_hex))
+                        pdf_canvas.line(x, y + 0.15, x + cell_size, y + 0.15)
+                        # White side
+                        pdf_canvas.setStrokeColor(HexColor("#FFFFFF"))
+                        pdf_canvas.line(x, y - 0.15, x + cell_size, y - 0.15)
+                
+                # LEFT edge
+                if px == 0 or region_map.get((px - 1, py)) != region_id:
+                    adjacent_region_id = region_map.get((px - 1, py)) if px > 0 else None
+                    adjacent_color = regions[adjacent_region_id]['color'] if adjacent_region_id and adjacent_region_id in regions else (255, 255, 255)
+                    
+                    if adjacent_color != (255, 255, 255) and adjacent_color != color_rgb:
+                        pdf_canvas.setLineWidth(0.25)
+                        # Current color (right side): draw inside current region, to the right
+                        pdf_canvas.setStrokeColor(HexColor(color_hex))
+                        pdf_canvas.line(x + 0.15, y, x + 0.15, y + cell_size)
+                        
+                        # Adjacent color (left side): draw inside adjacent region, to the left
+                        ar, ag, ab = adjacent_color
+                        adj_hex = f"#{ar:02x}{ag:02x}{ab:02x}"
+                        pdf_canvas.setStrokeColor(HexColor(adj_hex))
+                        pdf_canvas.line(x - 0.15, y, x - 0.15, y + cell_size)
+                    else:
+                        # Edge facing white: color on color's side, white on white's side
+                        pdf_canvas.setLineWidth(0.25)
+                        pdf_canvas.setStrokeColor(HexColor(color_hex))
+                        pdf_canvas.line(x + 0.15, y, x + 0.15, y + cell_size)
+                        # White side
+                        pdf_canvas.setStrokeColor(HexColor("#FFFFFF"))
+                        pdf_canvas.line(x - 0.15, y, x - 0.15, y + cell_size)
+                
+                # RIGHT edge
+                if px == width - 1 or region_map.get((px + 1, py)) != region_id:
+                    adjacent_region_id = region_map.get((px + 1, py)) if px < width - 1 else None
+                    adjacent_color = regions[adjacent_region_id]['color'] if adjacent_region_id and adjacent_region_id in regions else (255, 255, 255)
+                    
+                    if adjacent_color != (255, 255, 255) and adjacent_color != color_rgb:
+                        pdf_canvas.setLineWidth(0.25)
+                        # Current color (left side): draw inside current region, to the left
+                        pdf_canvas.setStrokeColor(HexColor(color_hex))
+                        pdf_canvas.line(x + cell_size - 0.15, y, x + cell_size - 0.15, y + cell_size)
+                        
+                        # Adjacent color (right side): draw inside adjacent region, to the right
+                        ar, ag, ab = adjacent_color
+                        adj_hex = f"#{ar:02x}{ag:02x}{ab:02x}"
+                        pdf_canvas.setStrokeColor(HexColor(adj_hex))
+                        pdf_canvas.line(x + cell_size + 0.15, y, x + cell_size + 0.15, y + cell_size)
+                    else:
+                        # Edge facing white: color on color's side, white on white's side
+                        pdf_canvas.setLineWidth(0.25)
+                        pdf_canvas.setStrokeColor(HexColor(color_hex))
+                        pdf_canvas.line(x + cell_size - 0.15, y, x + cell_size - 0.15, y + cell_size)
+                        # White side
+                        pdf_canvas.setStrokeColor(HexColor("#FFFFFF"))
+                        pdf_canvas.line(x + cell_size + 0.15, y, x + cell_size + 0.15, y + cell_size)
     
     def _draw_image_page(self, pdf_canvas) -> None:
         """
@@ -253,7 +562,7 @@ class PDFGenerator:
                                 f"{color.label} - #{color.hex_value}")
 
 
-def save_pdf(processed_image: Image.Image, palette: List[ColorPalette], output_path: str) -> None:
+def save_pdf(processed_image: Image.Image, palette: List[ColorPalette], output_path: str, merged_regions: bool = False, use_borders: bool = False) -> None:
     """
     Convenience function to generate and save a PDF (both pages in one file).
     
@@ -261,12 +570,14 @@ def save_pdf(processed_image: Image.Image, palette: List[ColorPalette], output_p
         processed_image: Processed PIL Image
         palette: List of ColorPalette objects
         output_path: Path to save PDF
+        merged_regions: If True, merge contiguous same-color regions
+        use_borders: If True, draw colored borders instead of text labels
     """
     generator = PDFGenerator(processed_image, palette)
-    generator.generate_pdf(output_path)
+    generator.generate_pdf(output_path, merged_regions=merged_regions, use_borders=use_borders)
 
 
-def save_pdf_separate(processed_image: Image.Image, palette: List[ColorPalette], output_path: str) -> Tuple[str, str]:
+def save_pdf_separate(processed_image: Image.Image, palette: List[ColorPalette], output_path: str, merged_regions: bool = False, use_borders: bool = False) -> Tuple[str, str]:
     """
     Generate and save two separate PDFs: grid and final image.
     
@@ -274,6 +585,8 @@ def save_pdf_separate(processed_image: Image.Image, palette: List[ColorPalette],
         processed_image: Processed PIL Image
         palette: List of ColorPalette objects
         output_path: Base path to save PDF files (without extension)
+        merged_regions: If True, merge contiguous same-color regions
+        use_borders: If True, draw colored borders instead of text labels
         
     Returns:
         Tuple of (grid_pdf_path, final_pdf_path)
@@ -292,7 +605,13 @@ def save_pdf_separate(processed_image: Image.Image, palette: List[ColorPalette],
     
     # Save grid only
     grid_canvas = canvas.Canvas(grid_path, pagesize=A4)
-    generator._draw_grid_page(grid_canvas)
+    if merged_regions:
+        if use_borders:
+            generator._draw_grid_page_merged_borders(grid_canvas)
+        else:
+            generator._draw_grid_page_merged(grid_canvas)
+    else:
+        generator._draw_grid_page(grid_canvas)
     grid_canvas.save()
     
     # Save final image only
