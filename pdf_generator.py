@@ -224,11 +224,12 @@ class PDFGenerator:
         for region_id, region_data in regions.items():
             if region_id not in labeled_regions:
                 color_rgb = region_data['color']
-                label = self.get_pixel_label(color_rgb)
                 
-                # Skip white regions (leave empty for paper color)
-                if color_rgb == (245, 245, 245):
+                # Skip white regions (leave empty for paper color) - check exact white (255,255,255)
+                if color_rgb == (255, 255, 255):
                     continue
+                
+                label = self.get_pixel_label(color_rgb)
                 
                 # Find all pixels in this region
                 region_pixels = [pos for pos, rid in region_map.items() if rid == region_id]

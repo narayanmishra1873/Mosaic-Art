@@ -9,9 +9,127 @@ from PIL import Image, ImageTk
 import threading
 import os
 from typing import List, Optional, Tuple
+from queue import Queue
 from config import ColorPalette, DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT, CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_ROWS, DEFAULT_COLUMNS
 from image_processor import ImageProcessor
 from pdf_generator import save_pdf, save_pdf_separate
+from progression_generator import export_grid_image
+from datetime import datetime
+
+
+class ProgressDialog:
+    """GUI Progress bar dialog for frame generation."""
+    
+    def __init__(self, parent, title="Processing..."):
+        """Initialize progress dialog."""
+        self.window = tk.Toplevel(parent)
+        self.window.title(title)
+        self.window.geometry("600x250")
+        self.window.resizable(False, False)
+        
+        # Create cancel event for thread communication
+        self.cancel_event = threading.Event()
+        self.cancel_event.clear()
+        
+        # Center window on screen
+        self.window.update_idletasks()
+        x = (self.window.winfo_screenwidth() // 2) - (self.window.winfo_width() // 2)
+        y = (self.window.winfo_screenheight() // 2) - (self.window.winfo_height() // 2)
+        self.window.geometry(f"+{x}+{y}")
+        
+        # Make it always on top
+        self.window.attributes('-topmost', True)
+        
+        # Main frame
+        main_frame = tk.Frame(self.window, bg='#f0f0f0', padx=20, pady=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Title label
+        title_label = tk.Label(main_frame, text=title, font=("Arial", 13, "bold"), bg='#f0f0f0')
+        title_label.pack(pady=(0, 15))
+        
+        # Status message
+        self.status_label = tk.Label(main_frame, text="Initializing...", font=("Arial", 10), bg='#f0f0f0', justify=tk.LEFT, wraplength=500)
+        self.status_label.pack(pady=(0, 15), anchor='w')
+        
+        # Progress bar frame
+        progress_frame = tk.Frame(main_frame, bg='#f0f0f0')
+        progress_frame.pack(fill=tk.X, pady=10)
+        
+        # Progress bar with better styling
+        self.progress = ttk.Progressbar(progress_frame, length=500, mode='determinate', style='TProgressbar')
+        self.progress.pack(fill=tk.X, pady=5)
+        
+        # Percentage label with stats
+        self.percent_label = tk.Label(progress_frame, text="0%", font=("Arial", 11, "bold"), bg='#f0f0f0', fg='#2196F3')
+        self.percent_label.pack(anchor='center', pady=5)
+        
+        # Info label (frame count, etc)
+        self.info_label = tk.Label(main_frame, text="", font=("Arial", 9), bg='#f0f0f0', fg='#666666')
+        self.info_label.pack(pady=(10, 0), anchor='w')
+        
+        # Button frame
+        button_frame = tk.Frame(main_frame, bg='#f0f0f0')
+        button_frame.pack(pady=(15, 0))
+        
+        # Cancel button
+        self.cancel_button = tk.Button(button_frame, text="Cancel", command=self._on_cancel, 
+                                       bg='#f44336', fg='white', padx=20, pady=8, font=("Arial", 10))
+        self.cancel_button.pack()
+        
+        # Prevent closing while processing
+        self.window.protocol("WM_DELETE_WINDOW", self._on_close_attempt)
+        self.allow_close = False
+        
+        # Queue for thread-safe updates
+        self.update_queue = Queue()
+        self._process_queue()
+    
+    def _on_cancel(self):
+        """Handle cancel button click."""
+        self.cancel_event.set()
+        self.cancel_button.config(state=tk.DISABLED, text="Cancelling...")
+    
+    def update(self, current, total, message=""):
+        """Thread-safe update of progress bar."""
+        self.update_queue.put(('update', current, total, message))
+    
+    def _process_queue(self):
+        """Process queued updates from worker thread."""
+        try:
+            while True:
+                try:
+                    item = self.update_queue.get_nowait()
+                    if item[0] == 'update':
+                        _, current, total, message = item
+                        if total > 0:
+                            percent = (current / total) * 100
+                            self.progress['value'] = percent
+                            self.percent_label.config(text=f"{percent:.0f}%")
+                        
+                        if message:
+                            self.status_label.config(text=message)
+                except:
+                    break
+        except:
+            pass
+        
+        # Schedule next queue check
+        if self.window.winfo_exists():
+            self.window.after(100, self._process_queue)
+    
+    def _on_close_attempt(self):
+        """Prevent closing during processing."""
+        if not self.allow_close:
+            messagebox.showwarning("Processing", "Please wait for processing to complete!")
+            return
+        self.window.destroy()
+    
+    def close(self):
+        """Close the dialog."""
+        self.allow_close = True
+        if self.window.winfo_exists():
+            self.window.destroy()
 
 
 class ColorByNumbersApp:
@@ -755,52 +873,123 @@ class ColorByNumbersApp:
     
 
     
-    def _download_pdf(self):
-        """Generate and save the PDF."""
+    def _show_pdf_options_dialog(self):
+        """Show unified dialog for all PDF generation options."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("PDF Generation Options")
+        dialog.geometry("550x650")
+        dialog.resizable(False, False)
+        
+        # Make dialog modal
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Center dialog on parent window
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (dialog.winfo_width() // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{x}+{y}")
+        
+        # Main frame with padding
+        main_frame = tk.Frame(dialog, bg="white")
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Title
+        title_label = tk.Label(main_frame, text="PDF Generation Options", font=("Helvetica", 14, "bold"), bg="white")
+        title_label.pack(anchor="w", pady=(0, 15))
+        
+        # Format selection
+        format_frame = tk.LabelFrame(main_frame, text="1. Output Format", font=("Helvetica", 11, "bold"), bg="white", fg="black")
+        format_frame.pack(fill="x", pady=(0, 15))
+        
+        format_var = tk.StringVar(value="combined")
+        tk.Radiobutton(format_frame, text="Separate files (grid + reference)", variable=format_var, value="separate", bg="white").pack(anchor="w", padx=15, pady=5)
+        tk.Radiobutton(format_frame, text="Single file (both pages combined)", variable=format_var, value="combined", bg="white").pack(anchor="w", padx=15, pady=5)
+        
+        # Style selection
+        style_frame = tk.LabelFrame(main_frame, text="2. Grid Style", font=("Helvetica", 11, "bold"), bg="white", fg="black")
+        style_frame.pack(fill="x", pady=(0, 15))
+        
+        style_var = tk.StringVar(value="merged")
+        tk.Radiobutton(style_frame, text="Merged Regions (fewer cells, larger regions)", variable=style_var, value="merged", bg="white").pack(anchor="w", padx=15, pady=5)
+        tk.Radiobutton(style_frame, text="Traditional (pixel-by-pixel grid)", variable=style_var, value="traditional", bg="white").pack(anchor="w", padx=15, pady=5)
+        
+        # Label type selection (only for merged regions)
+        label_frame = tk.LabelFrame(main_frame, text="3. Region Labels (for Merged Regions)", font=("Helvetica", 11, "bold"), bg="white", fg="black")
+        label_frame.pack(fill="x", pady=(0, 15))
+        
+        label_var = tk.StringVar(value="borders")
+        label_radio1 = tk.Radiobutton(label_frame, text="Colored Borders (actual color lines)", variable=label_var, value="borders", bg="white")
+        label_radio1.pack(anchor="w", padx=15, pady=5)
+        label_radio2 = tk.Radiobutton(label_frame, text="Text Labels (color numbers in regions)", variable=label_var, value="text", bg="white")
+        label_radio2.pack(anchor="w", padx=15, pady=5)
+        
+        # Pattern selection (only for merged regions)
+        pattern_frame = tk.LabelFrame(main_frame, text="4. Frame Fill Pattern (for Merged Regions)", font=("Helvetica", 11, "bold"), bg="white", fg="black")
+        pattern_frame.pack(fill="x", pady=(0, 15))
+        
+        pattern_var = tk.StringVar(value="spiral_outward")
+        patterns = [
+            ("spiral_outward", "Spiral Outward (from center)"),
+            ("top_to_bottom", "Top to Bottom"),
+            ("left_to_right", "Left to Right"),
+            ("smallest_first", "Smallest Regions First"),
+            ("color_bands", "Color Bands"),
+            ("random", "Random Order")
+        ]
+        
+        pattern_radio_list = []
+        for pattern_val, pattern_label in patterns:
+            radio = tk.Radiobutton(pattern_frame, text=pattern_label, variable=pattern_var, value=pattern_val, bg="white")
+            radio.pack(anchor="w", padx=15, pady=3)
+            pattern_radio_list.append(radio)
+        
+        # Update states based on style selection
+        def update_label_frame():
+            if style_var.get() == "merged":
+                label_radio1.config(state="normal")
+                label_radio2.config(state="normal")
+                label_frame.config(fg="black")
+                for radio in pattern_radio_list:
+                    radio.config(state="normal")
+                pattern_frame.config(fg="black")
+            else:
+                label_radio1.config(state="disabled")
+                label_radio2.config(state="disabled")
+                label_frame.config(fg="gray")
+                for radio in pattern_radio_list:
+                    radio.config(state="disabled")
+                pattern_frame.config(fg="gray")
+        
+        # Bind radio button changes to update label frame
+        for child in style_frame.winfo_children():
+            if isinstance(child, tk.Radiobutton):
+                child.config(command=update_label_frame)
+        
+        # Buttons frame
+        button_frame = tk.Frame(main_frame, bg="white")
+        button_frame.pack(fill="x", pady=(10, 0))
+        
+        def on_ok():
+            format_choice = format_var.get() == "separate"
+            style_choice = style_var.get() == "merged"
+            use_borders = label_var.get() == "borders" if style_choice else False
+            pattern_choice = pattern_var.get() if style_choice else "spiral_outward"
+            
+            dialog.destroy()
+            self._generate_and_save_pdf(format_choice, style_choice, use_borders, pattern_choice)
+        
+        def on_cancel():
+            dialog.destroy()
+        
+        tk.Button(button_frame, text="OK", command=on_ok, bg="#4CAF50", fg="white", padx=20, pady=8, font=("Helvetica", 10)).pack(side="right", padx=(5, 0))
+        tk.Button(button_frame, text="Cancel", command=on_cancel, bg="#f44336", fg="white", padx=20, pady=8, font=("Helvetica", 10)).pack(side="right")
+        
+        dialog.wait_window()
+    
+    def _generate_and_save_pdf(self, format_choice, style_choice, use_borders, pattern_choice="spiral_outward"):
+        """Generate and save PDF with specified options."""
         try:
-            # Ask user which format they want
-            format_choice = messagebox.askyesnocancel(
-                "PDF Format",
-                "How would you like to save the PDF?\n\n"
-                "YES: Two separate files (grid + final image)\n"
-                "NO: Single file with both pages\n"
-                "CANCEL: Don't save"
-            )
-            
-            if format_choice is None:
-                print("User cancelled save dialog")
-                return
-            
-            # Ask about grid style (traditional or merged regions)
-            style_choice = messagebox.askyesnocancel(
-                "Grid Style",
-                "How should the grid be labeled?\n\n"
-                "YES: Merged Regions (erase shared borders, label sections)\n"
-                "NO: Traditional (each pixel labeled separately)\n"
-                "CANCEL: Don't save"
-            )
-            
-            if style_choice is None:
-                print("User cancelled save dialog")
-                return
-            
-            # If merged regions, ask about label type
-            use_borders = False
-            if style_choice:  # Merged regions mode
-                label_choice = messagebox.askyesnocancel(
-                    "Label Style",
-                    "How should regions be marked?\n\n"
-                    "YES: Colored Borders (thin colored lines showing region color)\n"
-                    "NO: Text Labels (number/letter labels in each region)\n"
-                    "CANCEL: Don't save"
-                )
-                
-                if label_choice is None:
-                    print("User cancelled save dialog")
-                    return
-                
-                use_borders = label_choice  # True = borders, False = text labels
-            
             # Open save dialog
             file_path = filedialog.asksaveasfilename(
                 defaultextension=".pdf",
@@ -814,6 +1003,7 @@ class ColorByNumbersApp:
             print(f"Attempting to save PDF to: {file_path}")
             print(f"Selected preview: {self.selected_preview}")
             print(f"Available previews: {list(self.processed_previews.keys())}")
+            print(f"Format: {'Separate files' if format_choice else 'Single file'}")
             print(f"Grid style: {'Merged Regions' if style_choice else 'Traditional'}")
             print(f"Label style: {'Colored Borders' if use_borders else 'Text Labels'}")
             
@@ -822,15 +1012,131 @@ class ColorByNumbersApp:
                 processed_image = self.processed_previews[self.selected_preview]
                 print(f"Processing image: {processed_image.size}")
                 
-                if format_choice:  # YES - separate files
+                if format_choice:  # Separate files
                     grid_path, final_path = save_pdf_separate(processed_image, self.palette, file_path, merged_regions=style_choice, use_borders=use_borders)
                     print(f"Grid PDF saved to: {grid_path}")
                     print(f"Final PDF saved to: {final_path}")
-                    messagebox.showinfo("Success", f"PDFs saved successfully:\n\n{grid_path}\n{final_path}")
-                else:  # NO - single file
+                    
+                    # Also export grid as high-DPI image and generate progression frames
+                    if style_choice:  # Only for merged regions
+                        grid_image_path = grid_path.replace('_grid.pdf', '_grid.png')
+                        grid_image_path, grid_colors_path, region_map, regions = export_grid_image(
+                            processed_image, self.palette, grid_image_path, dpi=1000, label_type="borders" if use_borders else "text"
+                        )
+                        
+                        # Generate progression frames in background thread with GUI progress
+                        progression_dir = grid_path.replace('_grid.pdf', '_progression')
+                        progress_dialog = ProgressDialog(self.root, title="Generating Progression Frames...")
+                        
+                        def generate_frames_worker():
+                            """Worker function to run frame generation in background."""
+                            try:
+                                from progression_generator import ProgressionGenerator
+                                
+                                def progress_cb1(current, total, message):
+                                    progress_dialog.update(current, total, message)
+                                
+                                print(f"\nGenerating progression frames to {progression_dir}...")
+                                generator = ProgressionGenerator(
+                                    region_map=region_map,
+                                    regions=regions,
+                                    palette=self.palette,
+                                    width=processed_image.size[0],
+                                    height=processed_image.size[1],
+                                    dpi=1000,
+                                    label_type="borders" if use_borders else "text",
+                                    stop_event=progress_dialog.cancel_event
+                                )
+                                frames = generator.generate_progression_frames(
+                                    base_grid_image_path=grid_image_path,
+                                    output_dir=progression_dir,
+                                    region_colors_path=grid_colors_path,
+                                    pattern_name=pattern_choice,
+                                    regions_per_frame=25,
+                                    progress_callback=progress_cb1
+                                )
+                                print(f"✓ Generated {len(frames)} progression frames")
+                                
+                                # Schedule GUI updates on main thread
+                                self.root.after(500, lambda: progress_dialog.close())
+                                self.root.after(600, lambda: messagebox.showinfo("Success", 
+                                    f"PDFs, grid image, and {len(frames)} progression frames generated:\n\n"
+                                    f"PDFs:\n{grid_path}\n{final_path}\n\n"
+                                    f"Grid Image:\n{grid_image_path}\n\n"
+                                    f"Progression Frames ({len(frames)} total):\n{progression_dir}"))
+                            except Exception as e:
+                                error_msg = str(e)
+                                print(f"Error generating frames: {error_msg}")
+                                self.root.after(0, lambda: progress_dialog.close())
+                                self.root.after(100, lambda msg=error_msg: messagebox.showerror("Error", f"Failed to generate frames: {msg}"))
+                        
+                        # Start frame generation in background thread
+                        worker_thread = threading.Thread(target=generate_frames_worker, daemon=True)
+                        worker_thread.start()
+                    else:
+                        messagebox.showinfo("Success", f"PDFs saved successfully:\n\n{grid_path}\n{final_path}")
+                else:  # Single file
                     save_pdf(processed_image, self.palette, file_path, merged_regions=style_choice, use_borders=use_borders)
                     print(f"PDF saved to: {file_path}")
-                    messagebox.showinfo("Success", f"PDF saved successfully:\n{file_path}")
+                    
+                    # Also export grid as high-DPI image and generate progression frames
+                    if style_choice:  # Only for merged regions
+                        grid_image_path = file_path.replace('.pdf', '_grid.png')
+                        grid_image_path, grid_colors_path, region_map, regions = export_grid_image(
+                            processed_image, self.palette, grid_image_path, dpi=1000, label_type="borders" if use_borders else "text"
+                        )
+                        
+                        # Generate progression frames in background thread with GUI progress
+                        progression_dir = file_path.replace('.pdf', '_progression')
+                        progress_dialog = ProgressDialog(self.root, title="Generating Progression Frames...")
+                        
+                        def generate_frames_worker_2():
+                            """Worker function to run frame generation in background."""
+                            try:
+                                from progression_generator import ProgressionGenerator
+                                
+                                def progress_cb2(current, total, message):
+                                    progress_dialog.update(current, total, message)
+                                
+                                print(f"\nGenerating progression frames to {progression_dir}...")
+                                generator = ProgressionGenerator(
+                                    region_map=region_map,
+                                    regions=regions,
+                                    palette=self.palette,
+                                    width=processed_image.size[0],
+                                    height=processed_image.size[1],
+                                    dpi=1000,
+                                    label_type="borders" if use_borders else "text",
+                                    stop_event=progress_dialog.cancel_event
+                                )
+                                frames = generator.generate_progression_frames(
+                                    base_grid_image_path=grid_image_path,
+                                    output_dir=progression_dir,
+                                    region_colors_path=grid_colors_path,
+                                    pattern_name=pattern_choice,
+                                    regions_per_frame=25,
+                                    progress_callback=progress_cb2
+                                )
+                                print(f"✓ Generated {len(frames)} progression frames")
+                                
+                                # Schedule GUI updates on main thread
+                                self.root.after(500, lambda: progress_dialog.close())
+                                self.root.after(600, lambda: messagebox.showinfo("Success",
+                                    f"PDF, grid image, and {len(frames)} progression frames generated:\n\n"
+                                    f"PDF:\n{file_path}\n\n"
+                                    f"Grid Image:\n{grid_image_path}\n\n"
+                                    f"Progression Frames ({len(frames)} total):\n{progression_dir}"))
+                            except Exception as e:
+                                error_msg = str(e)
+                                print(f"Error generating frames: {error_msg}")
+                                self.root.after(0, lambda: progress_dialog.close())
+                                self.root.after(100, lambda msg=error_msg: messagebox.showerror("Error", f"Failed to generate frames: {msg}"))
+                        
+                        # Start frame generation in background thread
+                        worker_thread = threading.Thread(target=generate_frames_worker_2, daemon=True)
+                        worker_thread.start()
+                    else:
+                        messagebox.showinfo("Success", f"PDF saved successfully:\n{file_path}")
                 
                 # Option to start over
                 if messagebox.askyesno("New Conversion", "Would you like to convert another image?"):
@@ -841,10 +1147,14 @@ class ColorByNumbersApp:
                 messagebox.showerror("Error", "No image selected or processed. Please select an algorithm first.")
                 
         except Exception as e:
-            print(f"Exception in _download_pdf: {type(e).__name__}: {str(e)}")
+            print(f"Exception in _generate_and_save_pdf: {type(e).__name__}: {str(e)}")
             import traceback
             traceback.print_exc()
             messagebox.showerror("Save Error", f"Failed to save PDF: {str(e)}")
+    
+    def _download_pdf(self):
+        """Download PDF with unified options dialog."""
+        self._show_pdf_options_dialog()
 
 
 def main():
